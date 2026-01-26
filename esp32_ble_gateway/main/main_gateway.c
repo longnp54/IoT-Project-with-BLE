@@ -20,6 +20,9 @@
 #include "freertos/FreeRTOS.h"
 #include "driver/gpio.h"
 
+// ThingsBoard Module
+#include "thingsboard.h"
+
 #define GATTC_TAG "ESP32_GATEWAY"
 #define REMOTE_SERVICE_UUID        0x00FF
 #define REMOTE_NOTIFY_CHAR_UUID    0xFF01
@@ -40,14 +43,7 @@ static bool get_server = false;
 static esp_gattc_char_elem_t *char_elem_result   = NULL;
 static esp_gattc_descr_elem_t *descr_elem_result = NULL;
 
-typedef struct {
-    float temperature;
-    float humidity;
-    uint8_t led_state;
-    uint8_t is_valid;
-} env_sensor_data_t;
-
-static void parse_sensor_data(uint8_t *data, uint16_t len, env_sensor_data_t *sensor_data);
+static void parse_sensor_data(uint8_t *data, uint16_t len, sensor_data_t *sensor_data);
 static void led_init(void);
 
 /* Declare static functions */
@@ -111,7 +107,7 @@ static void led_init(void)
     gpio_set_level(LED_GPIO, LED_OFF);
 }
 
-static void parse_sensor_data(uint8_t *data, uint16_t len, env_sensor_data_t *sensor_data)
+static void parse_sensor_data(uint8_t *data, uint16_t len, sensor_data_t *sensor_data)
 {
     if (len != 6 || sensor_data == NULL) {
         ESP_LOGE(GATTC_TAG, "Invalid data length: %d (expected 6)", len);
@@ -134,10 +130,13 @@ static void parse_sensor_data(uint8_t *data, uint16_t len, env_sensor_data_t *se
 
     // Log parsed data
     if (sensor_data->is_valid) {
-        ESP_LOGI(GATTC_TAG, "[DATA] Temp: %.1f C, Humidity: %.1f%%, STM32_LED: %s",
+        ESP_LOGI(GATTC_TAG, "Temp: %.1f°C, Humidity: %.1f%%, STM32_LED: %s",
                  sensor_data->temperature,
                  sensor_data->humidity,
                  sensor_data->led_state ? "ON" : "OFF");
+        
+        // Send to ThingsBoard
+        thingsboard_send_data(sensor_data);
     } else {
         ESP_LOGW(GATTC_TAG, "WARNING: Invalid/stale data (Valid flag = 0)");
     }
@@ -161,6 +160,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         
         gl_profile_tab[PROFILE_A_APP_ID].conn_id = p_data->connect.conn_id;
         memcpy(gl_profile_tab[PROFILE_A_APP_ID].remote_bda, p_data->connect.remote_bda, sizeof(esp_bd_addr_t));
+        
         esp_ble_gattc_send_mtu_req(gattc_if, p_data->connect.conn_id);
         break;
     }
@@ -297,7 +297,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
     case ESP_GATTC_NOTIFY_EVT:
         // Parse and display sensor data
         if (p_data->notify.value_len == 6) {
-            env_sensor_data_t sensor_data;
+            sensor_data_t sensor_data;
             parse_sensor_data(p_data->notify.value, p_data->notify.value_len, &sensor_data);
         } else {
             ESP_LOGW(GATTC_TAG, "Unexpected data length: %d (expected 6)", p_data->notify.value_len);
@@ -419,6 +419,17 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+
+    // Initialize WiFi
+    ESP_LOGI(GATTC_TAG, "Initializing WiFi...");
+    thingsboard_wifi_init();
+    
+    // Initialize MQTT
+    ESP_LOGI(GATTC_TAG, "Initializing MQTT...");
+    thingsboard_mqtt_init();
+    
+    // Wait a bit for MQTT to connect
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 

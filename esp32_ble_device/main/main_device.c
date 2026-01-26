@@ -22,7 +22,7 @@
 #define TAG "BLE_DEVICE"
 
 // LED GPIO
-#define LED_GPIO  GPIO_NUM_2// Built-in LED trên hầu hết ESP32 board
+#define LED_GPIO  GPIO_NUM_2 // Built-in LED trên hầu hết ESP32 board
 
 // UUIDs
 #define SERVICE_UUID 0x00FF

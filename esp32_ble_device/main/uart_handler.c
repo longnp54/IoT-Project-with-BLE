@@ -3,6 +3,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>  // For rand() in simulation mode
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
@@ -53,6 +54,8 @@ static uint8_t calc_checksum(uint8_t *data, int len) {
 }
 
 // Gửi request sensor data tới STM32
+// COMMENTED OUT: Testing BLE without STM32 hardware - using simulated data
+/* 
 esp_err_t uart_request_sensor_data(void) {
     uint8_t request[4];
     
@@ -71,6 +74,7 @@ esp_err_t uart_request_sensor_data(void) {
         return ESP_FAIL;
     }
 }
+*/
 
 // Parse frame từ STM32
 // Expected: [0xAA][LEN=5][TEMP_H][TEMP_L][HUM_H][HUM_L][LED][CHECKSUM][0x55]
@@ -143,7 +147,55 @@ sensor_data_t get_sensor_data(void) {
 }
 
 // UART Receive Task - Request-Response mode
+// SIMULATION MODE: Generating fake sensor data for BLE testing
 void uart_receive_task(void *arg) {
+    ESP_LOGI(TAG, "[SIMULATION MODE] Generating fake sensor data (no STM32 needed)");
+    
+    // Simulated data variables
+    float sim_temp = 25.0;  // Starting temperature
+    float sim_hum = 60.0;   // Starting humidity
+    uint8_t sim_led = 0;    // LED state
+    
+    while (1) {
+        // Check if Gateway is connected
+        if (!g_connected) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        
+        // Generate simulated sensor data
+        // Temperature: 20°C - 30°C with small random changes
+        sim_temp += (float)(rand() % 21 - 10) / 10.0f;  // ±1.0°C
+        if (sim_temp < 20.0f) sim_temp = 20.0f;
+        if (sim_temp > 30.0f) sim_temp = 30.0f;
+        
+        // Humidity: 50% - 80% with small random changes
+        sim_hum += (float)(rand() % 21 - 10) / 10.0f;   // ±1.0%
+        if (sim_hum < 50.0f) sim_hum = 50.0f;
+        if (sim_hum > 80.0f) sim_hum = 80.0f;
+        
+        // LED state: Toggle occasionally
+        if (rand() % 5 == 0) {
+            sim_led = !sim_led;
+        }
+        
+        // Update global sensor data
+        g_sensor_data.temperature = sim_temp;
+        g_sensor_data.humidity = sim_hum;
+        g_sensor_data.led_state = sim_led;
+        g_sensor_data.timestamp = esp_timer_get_time();
+        g_sensor_data.valid = true;
+        
+        ESP_LOGI(TAG, "[SIMULATED] %.1f°C %.1f%% LED=%d", 
+                 sim_temp, sim_hum, sim_led);
+        
+        // Wait 2 seconds before next update
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+/* ORIGINAL UART CODE - Uncomment when STM32 is available
+void uart_receive_task_original(void *arg) {
     ESP_LOGI(TAG, "UART task ready (waiting for Gateway...)");
     
     uint8_t rx_buffer[128];
@@ -182,3 +234,4 @@ void uart_receive_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
+*/
