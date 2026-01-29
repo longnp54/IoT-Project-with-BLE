@@ -26,6 +26,7 @@
 #define GATTC_TAG "ESP32_GATEWAY"
 #define REMOTE_SERVICE_UUID        0x00FF
 #define REMOTE_NOTIFY_CHAR_UUID    0xFF01
+#define REMOTE_WRITE_CHAR_UUID     0xFF02
 #define PROFILE_NUM      1
 #define PROFILE_A_APP_ID 0
 #define INVALID_HANDLE   0
@@ -42,9 +43,11 @@ static bool connect    = false;
 static bool get_server = false;
 static esp_gattc_char_elem_t *char_elem_result   = NULL;
 static esp_gattc_descr_elem_t *descr_elem_result = NULL;
+static uint16_t write_char_handle = 0;
 
 static void parse_sensor_data(uint8_t *data, uint16_t len, sensor_data_t *sensor_data);
 static void led_init(void);
+static bool rpc_callback_handler(const char *method, const char *params, int request_id);
 
 /* Declare static functions */
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
@@ -60,6 +63,11 @@ static esp_bt_uuid_t remote_filter_service_uuid = {
 static esp_bt_uuid_t remote_filter_char_uuid = {
     .len = ESP_UUID_LEN_16,
     .uuid = {.uuid16 = REMOTE_NOTIFY_CHAR_UUID,},
+};
+
+static esp_bt_uuid_t remote_write_char_uuid = {
+    .len = ESP_UUID_LEN_16,
+    .uuid = {.uuid16 = REMOTE_WRITE_CHAR_UUID,},
 };
 
 static esp_bt_uuid_t notify_descr_uuid = {
@@ -105,6 +113,52 @@ static void led_init(void)
     };
     gpio_config(&io_conf);
     gpio_set_level(LED_GPIO, LED_OFF);
+}
+
+// RPC callback handler
+static bool rpc_callback_handler(const char *method, const char *params, int request_id)
+{
+    ESP_LOGI(GATTC_TAG, "RPC Received - Method: %s, Params: %s, ID: %d", method, params, request_id);
+    
+    if (strcmp(method, "setState") == 0) {
+        // Check if BLE is connected and write characteristic is available
+        if (!connect || write_char_handle == 0) {
+            ESP_LOGW(GATTC_TAG, "BLE not connected or WRITE characteristic not found");
+            return false;
+        }
+        
+        // Parse params to determine LED state
+        // params could be: true, false, "true", "false", "1", "0"
+        uint8_t led_command = 0;
+        
+        if (strstr(params, "true") != NULL || strstr(params, "1") != NULL) {
+            led_command = 1;
+        }
+        
+        // Send LED control command to ESP32 Device via BLE
+        // ESP32 Device will forward this to STM32 via UART
+        esp_err_t ret = esp_ble_gattc_write_char(
+            gl_profile_tab[PROFILE_A_APP_ID].gattc_if,
+            gl_profile_tab[PROFILE_A_APP_ID].conn_id,
+            write_char_handle,
+            1,  // Length: 1 byte
+            &led_command,
+            ESP_GATT_WRITE_TYPE_RSP,
+            ESP_GATT_AUTH_REQ_NONE
+        );
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(GATTC_TAG, "Sent LED command to ESP32 Device: %s (Device will forward to STM32)", 
+                    led_command ? "ON" : "OFF");
+            return true;
+        } else {
+            ESP_LOGE(GATTC_TAG, "Failed to send LED command: %s", esp_err_to_name(ret));
+            return false;
+        }
+    }
+    
+    ESP_LOGW(GATTC_TAG, "Unknown RPC method: %s", method);
+    return false;  // Unknown method
 }
 
 static void parse_sensor_data(uint8_t *data, uint16_t len, sensor_data_t *sensor_data)
@@ -228,6 +282,38 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
                     }
                 }
                 free(char_elem_result);
+                char_elem_result = NULL;
+                
+                // Find WRITE characteristic (0xFF02) for LED control
+                count = 0;
+                status = esp_ble_gattc_get_attr_count(gattc_if,
+                                                     p_data->search_cmpl.conn_id,
+                                                     ESP_GATT_DB_CHARACTERISTIC,
+                                                     gl_profile_tab[PROFILE_A_APP_ID].service_start_handle,
+                                                     gl_profile_tab[PROFILE_A_APP_ID].service_end_handle,
+                                                     INVALID_HANDLE,
+                                                     &count);
+                if (status == ESP_GATT_OK && count > 0) {
+                    char_elem_result = (esp_gattc_char_elem_t *)malloc(sizeof(esp_gattc_char_elem_t) * count);
+                    if (char_elem_result) {
+                        status = esp_ble_gattc_get_char_by_uuid(gattc_if,
+                                                               p_data->search_cmpl.conn_id,
+                                                               gl_profile_tab[PROFILE_A_APP_ID].service_start_handle,
+                                                               gl_profile_tab[PROFILE_A_APP_ID].service_end_handle,
+                                                               remote_write_char_uuid,
+                                                               char_elem_result,
+                                                               &count);
+                        if (status == ESP_GATT_OK && count > 0) {
+                            if (char_elem_result[0].properties & ESP_GATT_CHAR_PROP_BIT_WRITE) {
+                                write_char_handle = char_elem_result[0].char_handle;
+                                ESP_LOGI(GATTC_TAG, "WRITE Characteristic 0x%04X found, handle: 0x%04X (for LED control)", 
+                                        REMOTE_WRITE_CHAR_UUID, write_char_handle);
+                            }
+                        }
+                        free(char_elem_result);
+                        char_elem_result = NULL;
+                    }
+                }
             }else{
                 ESP_LOGE(GATTC_TAG, "No characteristic found");
             }
@@ -311,9 +397,17 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         }
         ESP_LOGI(GATTC_TAG, "Notifications enabled, waiting for data...");
         break;
+    case ESP_GATTC_WRITE_CHAR_EVT:
+        if (p_data->write.status != ESP_GATT_OK){
+            ESP_LOGE(GATTC_TAG, "Characteristic WRITE failed, status %x", p_data->write.status);
+        } else {
+            ESP_LOGI(GATTC_TAG, "LED command sent successfully to ESP32 Device (will be forwarded to STM32)");
+        }
+        break;
     case ESP_GATTC_DISCONNECT_EVT:
         connect = false;
         get_server = false;
+        write_char_handle = 0;  // Reset write handle on disconnect
         gpio_set_level(LED_GPIO, LED_OFF);
         
         ESP_LOGW(GATTC_TAG, "Disconnected, reconnecting...");
@@ -430,6 +524,10 @@ void app_main(void)
     
     // Wait a bit for MQTT to connect
     vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Register RPC callback for remote control
+    ESP_LOGI(GATTC_TAG, "Registering RPC callback...");
+    thingsboard_register_rpc_callback(rpc_callback_handler);
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 

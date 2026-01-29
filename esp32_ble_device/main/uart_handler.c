@@ -55,7 +55,6 @@ static uint8_t calc_checksum(uint8_t *data, int len) {
 
 // Gửi request sensor data tới STM32
 // COMMENTED OUT: Testing BLE without STM32 hardware - using simulated data
-/* 
 esp_err_t uart_request_sensor_data(void) {
     uint8_t request[4];
     
@@ -74,36 +73,51 @@ esp_err_t uart_request_sensor_data(void) {
         return ESP_FAIL;
     }
 }
-*/
 
-// Parse frame từ STM32
-// Expected: [0xAA][LEN=5][TEMP_H][TEMP_L][HUM_H][HUM_L][LED][CHECKSUM][0x55]
+
+// Parse frame từ STM32 (DHT11 - 8-bit resolution)
+// Expected: [0xAA][LEN=3][TEMP][HUM][LED][CHECKSUM][0x55]
+// Total: 7 bytes
 static bool parse_frame(uint8_t *buf, int len, sensor_data_t *data) {
+    ESP_LOGI(TAG, "Parsing buffer: %d bytes", len);
+    ESP_LOG_BUFFER_HEX(TAG, buf, len);
+    
     // Tìm start byte
     int start_idx = -1;
-    for (int i = 0; i < len - 8; i++) {
+    for (int i = 0; i < len; i++) {  // Tìm trong toàn bộ buffer
         if (buf[i] == FRAME_START) {
             start_idx = i;
+            ESP_LOGI(TAG, "Found START at index %d", i);
             break;
         }
     }
     
     if (start_idx == -1) {
+        ESP_LOGW(TAG, "No START byte found (expecting 0x%02X)", FRAME_START);
+        ESP_LOGW(TAG, "Buffer first byte: 0x%02X", buf[0]);
         return false;
     }
     
     uint8_t *frame = &buf[start_idx];
     uint8_t data_len = frame[1];
     
+    ESP_LOGI(TAG, "Data length: %d", data_len);
+    
     // Check có đủ data không (START + LEN + DATA + CHECKSUM + END)
-    if (start_idx + 2 + data_len + 2 > len) {
-        ESP_LOGW(TAG, "Incomplete frame");
+    int required_len = 2 + data_len + 2;  // Total frame size
+    int available_len = len - start_idx;
+    
+    if (available_len < required_len) {
+        ESP_LOGW(TAG, "Incomplete frame: need %d bytes, have %d", 
+                 required_len, available_len);
         return false;
     }
     
     // Validate checksum
     uint8_t recv_checksum = frame[2 + data_len];
     uint8_t calc_checksum_val = calc_checksum(&frame[1], data_len + 1); // LEN + DATA
+    
+    ESP_LOGI(TAG, "Checksum: recv=0x%02X calc=0x%02X", recv_checksum, calc_checksum_val);
     
     if (recv_checksum != calc_checksum_val) {
         ESP_LOGW(TAG, "Checksum mismatch: recv=0x%02X calc=0x%02X", 
@@ -113,24 +127,31 @@ static bool parse_frame(uint8_t *buf, int len, sensor_data_t *data) {
     
     // Check end byte
     if (frame[3 + data_len] != FRAME_END) {
-        ESP_LOGW(TAG, "End byte not found");
+        ESP_LOGW(TAG, "End byte not found at index %d: 0x%02X", 
+                 3 + data_len, frame[3 + data_len]);
         return false;
     }
     
-    // Parse data: [TEMP_H][TEMP_L][HUM_H][HUM_L][LED]
-    if (data_len >= 5) {
-        int16_t temp_raw = (frame[2] << 8) | frame[3];
-        uint16_t hum_raw = (frame[4] << 8) | frame[5];
-        uint8_t led = frame[6];
+    ESP_LOGI(TAG, "Frame validated - parsing data");
+    
+    // Parse data: [TEMP][HUM][LED] - DHT11 8-bit values
+    if (data_len >= 3) {
+        uint8_t temp = frame[2];   // Temperature (0-50°C)
+        uint8_t hum = frame[3];    // Humidity (20-90%RH)
+        uint8_t led = frame[4];    // LED state (0/1)
         
-        data->temperature = temp_raw / 100.0f;
-        data->humidity = hum_raw / 100.0f;
+        data->temperature = (float)temp;
+        data->humidity = (float)hum;
         data->led_state = led;
         data->timestamp = esp_timer_get_time();
         data->valid = true;
+        
+        ESP_LOGI(TAG, "Parsed: %.1f°C %.1f%% LED=%d", 
+                 data->temperature, data->humidity, data->led_state);
         return true;
     }
     
+    ESP_LOGW(TAG, "Data length too short: %d", data_len);
     return false;
 }
 
@@ -145,7 +166,7 @@ sensor_data_t get_sensor_data(void) {
     
     return g_sensor_data;
 }
-
+/*
 // UART Receive Task - Request-Response mode
 // SIMULATION MODE: Generating fake sensor data for BLE testing
 void uart_receive_task(void *arg) {
@@ -193,9 +214,10 @@ void uart_receive_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
+ */
 
-/* ORIGINAL UART CODE - Uncomment when STM32 is available
-void uart_receive_task_original(void *arg) {
+// ORIGINAL UART CODE - Uncomment when STM32 is available
+void uart_receive_task(void *arg) {
     ESP_LOGI(TAG, "UART task ready (waiting for Gateway...)");
     
     uint8_t rx_buffer[128];
@@ -208,16 +230,22 @@ void uart_receive_task_original(void *arg) {
             continue;
         }
         
+        // Clear buffer trước khi gửi
+        uart_flush(UART_NUM);
+        
         // 1. Gửi request tới STM32
         uart_request_sensor_data();
         
-        // 2. Đợi response (timeout 200ms)
+        // Đợi STM32 xử lý (DHT11 needs time)
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // 2. Đợi response (timeout 1500ms - giống Python test)
         int len = uart_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer), 
-                                  pdMS_TO_TICKS(200));
+                                  pdMS_TO_TICKS(1500));
         
         if (len > 0) {
-            ESP_LOGD(TAG, "Received %d bytes from STM32", len);
-            ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buffer, len, ESP_LOG_DEBUG);
+            ESP_LOGI(TAG, "Received %d bytes from STM32", len);
+            ESP_LOG_BUFFER_HEX(TAG, rx_buffer, len);
             
             // 3. Parse response
             if (parse_frame(rx_buffer, len, &temp_data)) {
@@ -226,7 +254,10 @@ void uart_receive_task_original(void *arg) {
                          temp_data.temperature, temp_data.humidity, temp_data.led_state);
             }
         } else if (len == 0) {
-            ESP_LOGW(TAG, "[RX] Timeout");
+            ESP_LOGW(TAG, "[RX] Timeout - No response from STM32");
+            g_sensor_data.valid = false;
+        } else if (len < 0) {
+            ESP_LOGE(TAG, "[RX] UART read error: %d", len);
             g_sensor_data.valid = false;
         }
         
@@ -234,4 +265,4 @@ void uart_receive_task_original(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
-*/
+
