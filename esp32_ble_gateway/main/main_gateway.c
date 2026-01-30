@@ -183,16 +183,17 @@ static void parse_sensor_data(uint8_t *data, uint16_t len, sensor_data_t *sensor
     sensor_data->is_valid = data[5];
 
     // Log parsed data
+    ESP_LOGI(GATTC_TAG, "[PARSED] Temp: %.1f°C, Humidity: %.1f%%, LED: %s, Valid: %d",
+             sensor_data->temperature,
+             sensor_data->humidity,
+             sensor_data->led_state ? "ON" : "OFF",
+             sensor_data->is_valid);
+    
     if (sensor_data->is_valid) {
-        ESP_LOGI(GATTC_TAG, "Temp: %.1f°C, Humidity: %.1f%%, STM32_LED: %s",
-                 sensor_data->temperature,
-                 sensor_data->humidity,
-                 sensor_data->led_state ? "ON" : "OFF");
-        
-        // Send to ThingsBoard
+        ESP_LOGI(GATTC_TAG, "[SEND] Sending to ThingsBoard...");
         thingsboard_send_data(sensor_data);
     } else {
-        ESP_LOGW(GATTC_TAG, "WARNING: Invalid/stale data (Valid flag = 0)");
+        ESP_LOGW(GATTC_TAG, "[SKIP] Data invalid (Valid flag = 0), not sending to ThingsBoard");
     }
 }
 
@@ -218,20 +219,35 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         esp_ble_gattc_send_mtu_req(gattc_if, p_data->connect.conn_id);
         break;
     }
+    case ESP_GATTC_OPEN_EVT:
+        if (param->open.status != ESP_GATT_OK){
+            ESP_LOGE(GATTC_TAG, "Open failed, status %d", param->open.status);
+            break;
+        }
+        ESP_LOGI(GATTC_TAG, "[OPEN] Starting service discovery...");
+        break;
     case ESP_GATTC_DIS_SRVC_CMPL_EVT:
         if (param->dis_srvc_cmpl.status != ESP_GATT_OK){
             ESP_LOGE(GATTC_TAG, "Service discover failed, status %d", param->dis_srvc_cmpl.status);
             break;
         }
-        ESP_LOGI(GATTC_TAG, "Service discovery complete, searching service 0x%04X", REMOTE_SERVICE_UUID);
+        ESP_LOGI(GATTC_TAG, "[DIS_SRVC_CMPL] Service discovery complete, searching service 0x%04X", REMOTE_SERVICE_UUID);
         esp_ble_gattc_search_service(gattc_if, param->dis_srvc_cmpl.conn_id, &remote_filter_service_uuid);
         break;
     case ESP_GATTC_SEARCH_RES_EVT: {
+        ESP_LOGI(GATTC_TAG, "[SEARCH_RES] UUID len=%d, UUID16=0x%04X, start=0x%04X, end=0x%04X",
+                 p_data->search_res.srvc_id.uuid.len,
+                 p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 ? p_data->search_res.srvc_id.uuid.uuid.uuid16 : 0,
+                 p_data->search_res.start_handle,
+                 p_data->search_res.end_handle);
+        
         if (p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 && p_data->search_res.srvc_id.uuid.uuid.uuid16 == REMOTE_SERVICE_UUID) {
-            ESP_LOGI(GATTC_TAG, "Service 0x%04X found", REMOTE_SERVICE_UUID);
+            ESP_LOGI(GATTC_TAG, "✓ Service 0x%04X found!", REMOTE_SERVICE_UUID);
             get_server = true;
             gl_profile_tab[PROFILE_A_APP_ID].service_start_handle = p_data->search_res.start_handle;
             gl_profile_tab[PROFILE_A_APP_ID].service_end_handle = p_data->search_res.end_handle;
+        } else {
+            ESP_LOGW(GATTC_TAG, "✗ Service UUID mismatch (expected 0x%04X)", REMOTE_SERVICE_UUID);
         }
         break;
     }
@@ -240,7 +256,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             ESP_LOGE(GATTC_TAG, "Service search failed, status %x", p_data->search_cmpl.status);
             break;
         }
-        ESP_LOGI(GATTC_TAG, "Service search complete");
+        ESP_LOGI(GATTC_TAG, "Service search complete (get_server=%d)", get_server);
         if (get_server){
             uint16_t count = 0;
             esp_gatt_status_t status = esp_ble_gattc_get_attr_count( gattc_if,
@@ -381,13 +397,15 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         break;
     }
     case ESP_GATTC_NOTIFY_EVT:
+        ESP_LOGI(GATTC_TAG, "[NOTIFY] Received %d bytes from device", p_data->notify.value_len);
+        ESP_LOG_BUFFER_HEX(GATTC_TAG, p_data->notify.value, p_data->notify.value_len);
+        
         // Parse and display sensor data
         if (p_data->notify.value_len == 6) {
             sensor_data_t sensor_data;
             parse_sensor_data(p_data->notify.value, p_data->notify.value_len, &sensor_data);
         } else {
             ESP_LOGW(GATTC_TAG, "Unexpected data length: %d (expected 6)", p_data->notify.value_len);
-            ESP_LOG_BUFFER_HEX(GATTC_TAG, p_data->notify.value, p_data->notify.value_len);
         }
         break;
     case ESP_GATTC_WRITE_DESCR_EVT:

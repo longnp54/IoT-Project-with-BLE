@@ -26,14 +26,20 @@
 
 // UUIDs
 #define SERVICE_UUID 0x00FF
-#define CHAR_UUID 0xFF01
+#define CHAR_NOTIFY_UUID 0xFF01  // Sensor data notification
+#define CHAR_WRITE_UUID  0xFF02  // LED control command
 
 // BLE State
 static uint16_t g_conn_id = 0;
-static uint16_t g_char_handle = 0;
+static uint16_t g_service_handle = 0;     // Service handle
+static uint16_t g_char_handle = 0;        // NOTIFY characteristic handle
+static uint16_t g_cccd_handle = 0;        // CCCD descriptor handle (QUAN TRỌNG)
+static uint16_t g_write_char_handle = 0;  // WRITE characteristic handle
 static esp_gatt_if_t g_gatts_if = ESP_GATT_IF_NONE;
 bool g_connected = false;  // Exported to uart_handler.c
 static bool g_notify_enabled = false;
+static bool g_write_char_added = false;   // Flag: write char added?
+static bool g_cccd_added = false;         // Flag: CCCD added?
 
 // Advertising data
 static esp_ble_adv_data_t adv_data = {
@@ -92,33 +98,72 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             .id.uuid.len = ESP_UUID_LEN_16,
             .id.uuid.uuid.uuid16 = SERVICE_UUID,
         };
-        esp_ble_gatts_create_service(gatts_if, &service_id, 4);
+        esp_ble_gatts_create_service(gatts_if, &service_id, 8);  // Tăng từ 4 lên 8
         break;
-
+    
     case ESP_GATTS_CREATE_EVT:
-        esp_ble_gatts_start_service(param->create.service_handle);
+        g_service_handle = param->create.service_handle;
+        ESP_LOGI(TAG, "Service created, handle: 0x%04X", g_service_handle);
         
-        // Add characteristic
-        esp_bt_uuid_t char_uuid = {
+        // Add NOTIFY characteristic (0xFF01) - Sensor data
+        // NOTE: Chỉ add NOTIFY trước, WRITE sẽ add sau trong callback
+        esp_bt_uuid_t notify_char_uuid = {
             .len = ESP_UUID_LEN_16,
-            .uuid.uuid16 = CHAR_UUID,
+            .uuid.uuid16 = CHAR_NOTIFY_UUID,
         };
-        esp_gatt_char_prop_t property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
-        esp_ble_gatts_add_char(param->create.service_handle, &char_uuid,
+        esp_gatt_char_prop_t notify_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+        esp_ble_gatts_add_char(g_service_handle, &notify_char_uuid,
                               ESP_GATT_PERM_READ,
-                              property, NULL, NULL);
+                              notify_property, NULL, NULL);
         break;
 
     case ESP_GATTS_ADD_CHAR_EVT:
-        g_char_handle = param->add_char.attr_handle;
-        
-        // Add descriptor (CCCD for notification)
-        esp_bt_uuid_t descr_uuid = {
-            .len = ESP_UUID_LEN_16,
-            .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,
-        };
-        esp_ble_gatts_add_char_descr(param->add_char.service_handle, &descr_uuid,
-                                     ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, NULL, NULL);
+        if (param->add_char.char_uuid.uuid.uuid16 == CHAR_NOTIFY_UUID) {
+            g_char_handle = param->add_char.attr_handle;
+            ESP_LOGI(TAG, "NOTIFY Characteristic added, handle: 0x%04X", g_char_handle);
+            
+            // Add descriptor (CCCD for notification)
+            esp_bt_uuid_t descr_uuid = {
+                .len = ESP_UUID_LEN_16,
+                .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,
+            };
+            
+            esp_ble_gatts_add_char_descr(param->add_char.service_handle, 
+                                         &descr_uuid,
+                                         ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, 
+                                         NULL, NULL);
+        } else if (param->add_char.char_uuid.uuid.uuid16 == CHAR_WRITE_UUID) {
+            g_write_char_handle = param->add_char.attr_handle;
+            ESP_LOGI(TAG, "WRITE Characteristic added, handle: 0x%04X", g_write_char_handle);
+            
+            // Start service after ALL characteristics and descriptors are added
+            esp_err_t ret = esp_ble_gatts_start_service(g_service_handle);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "✓ Service 0x%04X STARTED successfully!", SERVICE_UUID);
+            } else {
+                ESP_LOGE(TAG, "Failed to start service: %s", esp_err_to_name(ret));
+            }
+        }
+        break;
+
+    case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        if (param->add_char_descr.status == ESP_GATT_OK) {
+            g_cccd_handle = param->add_char_descr.attr_handle;
+            ESP_LOGI(TAG, "CCCD Descriptor added, handle: 0x%04X", g_cccd_handle);
+            
+            // Now add WRITE characteristic (0xFF02) - LED control
+            ESP_LOGI(TAG, "Adding WRITE characteristic...");
+            esp_bt_uuid_t write_char_uuid = {
+                .len = ESP_UUID_LEN_16,
+                .uuid.uuid16 = CHAR_WRITE_UUID,
+            };
+            esp_gatt_char_prop_t write_property = ESP_GATT_CHAR_PROP_BIT_WRITE;
+            esp_ble_gatts_add_char(g_service_handle, &write_char_uuid,
+                                  ESP_GATT_PERM_WRITE,
+                                  write_property, NULL, NULL);
+        } else {
+            ESP_LOGE(TAG, "Failed to add CCCD descriptor, status: %d", param->add_char_descr.status);
+        }
         break;
 
     case ESP_GATTS_CONNECT_EVT:
@@ -159,7 +204,28 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     }
 
     case ESP_GATTS_WRITE_EVT:
-        if (param->write.len == 2) {
+        // Kiểm tra WRITE vào WRITE characteristic (LED control)
+        if (param->write.handle == g_write_char_handle && param->write.len == 1) {
+            uint8_t led_cmd = param->write.value[0];
+            ESP_LOGI(TAG, "[LED CMD] Received from Gateway: %d (%s)", 
+                     led_cmd, led_cmd ? "ON" : "OFF");
+            
+            // Send task notification to UART task to handle LED command immediately
+            // This interrupts the sensor request cycle
+            if (uart_task_handle != NULL) {
+                uint32_t notification = LED_CMD_NOTIFICATION_BIT | led_cmd;
+                xTaskNotifyFromISR(uart_task_handle, notification, eSetValueWithOverwrite, NULL);
+                ESP_LOGI(TAG, "[LED CMD] Notified UART task");
+            } else {
+                ESP_LOGW(TAG, "[LED CMD] UART task not ready");
+            }
+            
+            // Send response
+            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, 
+                                       param->write.trans_id, ESP_GATT_OK, NULL);
+        }
+        // Kiểm tra WRITE vào CCCD (enable/disable notification)
+        else if (param->write.len == 2) {
             uint16_t value = param->write.value[0] | (param->write.value[1] << 8);
             if (value == 0x0001) {
                 g_notify_enabled = true;
@@ -168,9 +234,10 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                 g_notify_enabled = false;
                 ESP_LOGI(TAG, "[NOTIFY] Disabled");
             }
-        }
-        if (param->write.need_rsp) {
-            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+            if (param->write.need_rsp) {
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, 
+                                           param->write.trans_id, ESP_GATT_OK, NULL);
+            }
         }
         break;
 

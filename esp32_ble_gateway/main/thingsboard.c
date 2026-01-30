@@ -274,15 +274,26 @@ void thingsboard_mqtt_init(void)
 // Send data to ThingsBoard (Device API - đơn giản)
 void thingsboard_send_data(sensor_data_t *sensor_data)
 {
+    ESP_LOGI(TB_TAG, "[SEND] thingsboard_send_data() called");
+    
     if (!mqtt_connected || mqtt_client == NULL) {
-        ESP_LOGW(TB_TAG, "MQTT not connected, skipping send");
+        ESP_LOGW(TB_TAG, "[SEND] MQTT not connected (mqtt_connected=%d, mqtt_client=%p), skipping send", 
+                 mqtt_connected, mqtt_client);
         return;
     }
 
-    if (sensor_data == NULL || !sensor_data->is_valid) {
-        ESP_LOGW(TB_TAG, "Invalid sensor data, skipping send");
+    if (sensor_data == NULL) {
+        ESP_LOGW(TB_TAG, "[SEND] sensor_data is NULL, skipping send");
         return;
     }
+    
+    if (!sensor_data->is_valid) {
+        ESP_LOGW(TB_TAG, "[SEND] Data invalid (is_valid=%d), skipping send", sensor_data->is_valid);
+        return;
+    }
+    
+    ESP_LOGI(TB_TAG, "[SEND] Preparing payload: T=%.1f°C, H=%.1f%%, LED=%d",
+             sensor_data->temperature, sensor_data->humidity, sensor_data->led_state);
 
     // Tạo JSON đơn giản: {"temperature":25.5,"humidity":60.2,"led_state":1}
     char payload[256];

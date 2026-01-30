@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // UART Configuration
 #define UART_NUM           UART_NUM_1
@@ -23,6 +25,10 @@
 #define FRAME_START        0xAA
 #define FRAME_END          0x55
 #define CMD_REQUEST_DATA   0x01  // Lệnh yêu cầu sensor data
+#define CMD_LED_CONTROL    0x02  // Lệnh điều khiển LED
+
+// Notification bit for LED command (bits 0-7 reserved for LED state)
+#define LED_CMD_NOTIFICATION_BIT  (1UL << 31)
 
 // Sensor data structure
 typedef struct {
@@ -36,7 +42,11 @@ typedef struct {
 // Function prototypes
 esp_err_t uart_init(void);
 esp_err_t uart_request_sensor_data(void);  // Gửi request tới STM32
+esp_err_t uart_send_led_command(uint8_t led_state);  // Gửi lệnh LED
 void uart_receive_task(void *arg);
 sensor_data_t get_sensor_data(void);
+
+// UART task handle - exported for LED command notification
+extern TaskHandle_t uart_task_handle;
 
 #endif // UART_HANDLER_H

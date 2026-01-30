@@ -11,11 +11,15 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "uart_handler.h"
+#include <cJSON.h>
 
 static const char *TAG = "UART_HANDLER";
 
 // External variable from gatts_simple.c
 extern bool g_connected;
+
+// UART task handle - will be set when task is created
+TaskHandle_t uart_task_handle = NULL;
 
 // Global sensor data (thread-safe)
 static sensor_data_t g_sensor_data = {
@@ -54,7 +58,6 @@ static uint8_t calc_checksum(uint8_t *data, int len) {
 }
 
 // Gửi request sensor data tới STM32
-// COMMENTED OUT: Testing BLE without STM32 hardware - using simulated data
 esp_err_t uart_request_sensor_data(void) {
     uint8_t request[4];
     
@@ -70,6 +73,31 @@ esp_err_t uart_request_sensor_data(void) {
         return ESP_OK;
     } else {
         ESP_LOGE(TAG, "Failed to send request");
+        return ESP_FAIL;
+    }
+}
+
+// Gửi lệnh điều khiển LED tới STM32
+// Frame: [0xAA][CMD_LED_CONTROL][LED_STATE][CHECKSUM][0x55]
+esp_err_t uart_send_led_command(uint8_t led_state) {
+    uint8_t command[5];
+    
+    command[0] = FRAME_START;              // 0xAA
+    command[1] = CMD_LED_CONTROL;          // 0x02
+    command[2] = led_state;                // 0=OFF, 1=ON
+    command[3] = calc_checksum(&command[1], 2);  // Checksum of CMD + LED_STATE
+    command[4] = FRAME_END;                // 0x55
+    
+    ESP_LOGI(TAG, "Sending LED command to STM32: %s", led_state ? "ON" : "OFF");
+    ESP_LOG_BUFFER_HEX(TAG, command, 5);
+    
+    int written = uart_write_bytes(UART_NUM, (const char*)command, sizeof(command));
+    
+    if (written == sizeof(command)) {
+        ESP_LOGI(TAG, "LED command sent successfully");
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "Failed to send LED command: wrote %d bytes", written);
         return ESP_FAIL;
     }
 }
@@ -166,62 +194,17 @@ sensor_data_t get_sensor_data(void) {
     
     return g_sensor_data;
 }
-/*
-// UART Receive Task - Request-Response mode
-// SIMULATION MODE: Generating fake sensor data for BLE testing
-void uart_receive_task(void *arg) {
-    ESP_LOGI(TAG, "[SIMULATION MODE] Generating fake sensor data (no STM32 needed)");
-    
-    // Simulated data variables
-    float sim_temp = 25.0;  // Starting temperature
-    float sim_hum = 60.0;   // Starting humidity
-    uint8_t sim_led = 0;    // LED state
-    
-    while (1) {
-        // Check if Gateway is connected
-        if (!g_connected) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        
-        // Generate simulated sensor data
-        // Temperature: 20°C - 30°C with small random changes
-        sim_temp += (float)(rand() % 21 - 10) / 10.0f;  // ±1.0°C
-        if (sim_temp < 20.0f) sim_temp = 20.0f;
-        if (sim_temp > 30.0f) sim_temp = 30.0f;
-        
-        // Humidity: 50% - 80% with small random changes
-        sim_hum += (float)(rand() % 21 - 10) / 10.0f;   // ±1.0%
-        if (sim_hum < 50.0f) sim_hum = 50.0f;
-        if (sim_hum > 80.0f) sim_hum = 80.0f;
-        
-        // LED state: Toggle occasionally
-        if (rand() % 5 == 0) {
-            sim_led = !sim_led;
-        }
-        
-        // Update global sensor data
-        g_sensor_data.temperature = sim_temp;
-        g_sensor_data.humidity = sim_hum;
-        g_sensor_data.led_state = sim_led;
-        g_sensor_data.timestamp = esp_timer_get_time();
-        g_sensor_data.valid = true;
-        
-        ESP_LOGI(TAG, "[SIMULATED] %.1f°C %.1f%% LED=%d", 
-                 sim_temp, sim_hum, sim_led);
-        
-        // Wait 2 seconds before next update
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
- */
 
-// ORIGINAL UART CODE - Uncomment when STM32 is available
+
+//UART CODE 
 void uart_receive_task(void *arg) {
+    // Save task handle for LED command notification
+    uart_task_handle = xTaskGetCurrentTaskHandle();
     ESP_LOGI(TAG, "UART task ready (waiting for Gateway...)");
     
     uint8_t rx_buffer[128];
     sensor_data_t temp_data;
+    uint32_t notification_value = 0;
     
     while (1) {
         // Check if Gateway is connected
@@ -230,9 +213,31 @@ void uart_receive_task(void *arg) {
             continue;
         }
         
-        // Clear buffer trước khi gửi
-        uart_flush(UART_NUM);
+        // Check for LED command notification (non-blocking, 100ms timeout)
+        if (xTaskNotifyWait(0, 0xFFFFFFFF, &notification_value, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // LED command received from BLE
+            if (notification_value & LED_CMD_NOTIFICATION_BIT) {
+                uint8_t led_state = notification_value & 0xFF;
+                ESP_LOGI(TAG, "[LED CMD INTERRUPT] Processing LED command: %d", led_state);
+                
+                // Clear buffer before sending LED command
+                uart_flush(UART_NUM);
+                
+                // Send LED command to STM32
+                uart_send_led_command(led_state);
+                
+                // Give STM32 time to process LED command
+                vTaskDelay(pdMS_TO_TICKS(500));
+                
+                // Clear buffer after LED command
+                uart_flush(UART_NUM);
+                
+                // Continue to sensor request after LED is processed
+                continue;
+            }
+        }
         
+        // Normal sensor request flow (when no LED command)
         // 1. Gửi request tới STM32
         uart_request_sensor_data();
         
