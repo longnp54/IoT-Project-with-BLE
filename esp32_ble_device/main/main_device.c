@@ -38,8 +38,6 @@ static uint16_t g_write_char_handle = 0;  // WRITE characteristic handle
 static esp_gatt_if_t g_gatts_if = ESP_GATT_IF_NONE;
 bool g_connected = false;  // Exported to uart_handler.c
 static bool g_notify_enabled = false;
-static bool g_write_char_added = false;   // Flag: write char added?
-static bool g_cccd_added = false;         // Flag: CCCD added?
 
 // Advertising data
 static esp_ble_adv_data_t adv_data = {
@@ -207,20 +205,17 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         // Kiểm tra WRITE vào WRITE characteristic (LED control)
         if (param->write.handle == g_write_char_handle && param->write.len == 1) {
             uint8_t led_cmd = param->write.value[0];
-            ESP_LOGI(TAG, "[LED CMD] Received from Gateway: %d (%s)", 
+            ESP_LOGI(TAG, "[LED] Received command: %d (%s)", 
                      led_cmd, led_cmd ? "ON" : "OFF");
             
-            // Send task notification to UART task to handle LED command immediately
-            // This interrupts the sensor request cycle
-            if (uart_task_handle != NULL) {
-                uint32_t notification = LED_CMD_NOTIFICATION_BIT | led_cmd;
-                xTaskNotifyFromISR(uart_task_handle, notification, eSetValueWithOverwrite, NULL);
-                ESP_LOGI(TAG, "[LED CMD] Notified UART task");
-            } else {
-                ESP_LOGW(TAG, "[LED CMD] UART task not ready");
+            // Enqueue LED command to UART command pipeline
+            // This ensures proper synchronization without blocking
+            esp_err_t ret = uart_enqueue_led_command(led_cmd);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "[LED] Failed to enqueue command");
             }
             
-            // Send response
+            // Send BLE response immediately (command is queued, not executed yet)
             esp_ble_gatts_send_response(gatts_if, param->write.conn_id, 
                                        param->write.trans_id, ESP_GATT_OK, NULL);
         }
@@ -276,6 +271,23 @@ void notify_task(void *arg) {
     }
 }
 
+// Periodic sensor request task
+void sensor_request_task(void *arg) {
+    ESP_LOGI(TAG, "[SENSOR_REQ] Task started");
+    
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(3000));  // Request every 3 seconds
+        
+        if (g_connected) {
+            // Enqueue sensor request
+            esp_err_t ret = uart_enqueue_sensor_request();
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "[SENSOR_REQ] Failed to enqueue");
+            }
+        }
+    }
+}
+
 void app_main(void) {
     esp_log_level_set("*", ESP_LOG_INFO);
     
@@ -307,7 +319,9 @@ void app_main(void) {
     
     ESP_ERROR_CHECK(uart_init());
     
-    xTaskCreate(uart_receive_task, "uart", 4096, NULL, 10, NULL);
+    // Create tasks with queue-based architecture
+    xTaskCreate(uart_executor_task, "uart_exec", 4096, NULL, 10, NULL);
+    xTaskCreate(sensor_request_task, "sensor_req", 2048, NULL, 5, NULL);
     xTaskCreate(notify_task, "notify", 4096, NULL, 5, NULL);
     
     ESP_LOGI(TAG, "System Ready!");

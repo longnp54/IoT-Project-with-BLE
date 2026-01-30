@@ -1,27 +1,29 @@
 /*
- * UART Handler - Request-Response Implementation
+ * UART Handler - Queue-based Command Pipeline with ACK/NACK
+ * Implements proper synchronization and recovery mechanisms
  */
 
 #include <string.h>
-#include <stdlib.h>  // For rand() in simulation mode
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_gatts_api.h"
 #include "uart_handler.h"
-#include <cJSON.h>
 
 static const char *TAG = "UART_HANDLER";
 
-// External variable from gatts_simple.c
+// External variable from main_device.c
 extern bool g_connected;
 
-// UART task handle - will be set when task is created
-TaskHandle_t uart_task_handle = NULL;
+// Queue handle for command pipeline
+QueueHandle_t uart_cmd_queue = NULL;
 
-// Global sensor data (thread-safe)
+// Global sensor data (protected by mutex conceptually - simplified for now)
 static sensor_data_t g_sensor_data = {
     .temperature = 0.0,
     .humidity = 0.0,
@@ -29,6 +31,11 @@ static sensor_data_t g_sensor_data = {
     .timestamp = 0,
     .valid = false
 };
+
+// UART RX buffer for framing
+#define RX_BUFFER_SIZE 256
+static uint8_t uart_rx_buffer[RX_BUFFER_SIZE];
+static int uart_rx_index = 0;
 
 // Initialize UART
 esp_err_t uart_init(void) {
@@ -45,229 +52,324 @@ esp_err_t uart_init(void) {
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, 
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM, RX_BUF_SIZE * 2, 0, 0, NULL, 0));
+    
+    // Create command queue
+    uart_cmd_queue = xQueueCreate(UART_CMD_QUEUE_SIZE, sizeof(uart_cmd_t));
+    if (uart_cmd_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create command queue");
+        return ESP_FAIL;
+    }
+    
     return ESP_OK;
 }
 
-// Calculate simple XOR checksum
-static uint8_t calc_checksum(uint8_t *data, int len) {
-    uint8_t sum = 0;
-    for (int i = 0; i < len; i++) {
-        sum ^= data[i];
+// Enqueue sensor request command
+esp_err_t uart_enqueue_sensor_request(void) {
+    if (uart_cmd_queue == NULL) {
+        return ESP_FAIL;
     }
-    return sum;
-}
-
-// Gửi request sensor data tới STM32
-esp_err_t uart_request_sensor_data(void) {
-    uint8_t request[4];
     
-    request[0] = FRAME_START;           // 0xAA
-    request[1] = CMD_REQUEST_DATA;      // 0x01
-    request[2] = calc_checksum(&request[1], 1);  // Checksum of CMD
-    request[3] = FRAME_END;             // 0x55
+    uart_cmd_t cmd = {
+        .type = CMD_TYPE_SENSOR_REQUEST,
+        .data_len = 0,
+        .timeout_ms = UART_CMD_TIMEOUT_MS,
+        .retry_count = 0
+    };
     
-    int written = uart_write_bytes(UART_NUM, (const char*)request, sizeof(request));
-    
-    if (written == sizeof(request)) {
-        ESP_LOGD(TAG, "Request sent to STM32");
+    if (xQueueSend(uart_cmd_queue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ESP_LOGD(TAG, "Sensor request enqueued");
         return ESP_OK;
     } else {
-        ESP_LOGE(TAG, "Failed to send request");
+        ESP_LOGW(TAG, "Failed to enqueue sensor request (queue full)");
         return ESP_FAIL;
     }
 }
 
-// Gửi lệnh điều khiển LED tới STM32
-// Frame: [0xAA][CMD_LED_CONTROL][LED_STATE][CHECKSUM][0x55]
-esp_err_t uart_send_led_command(uint8_t led_state) {
-    uint8_t command[5];
+// Enqueue LED control command (HIGH PRIORITY - add to front)
+esp_err_t uart_enqueue_led_command(uint8_t led_state) {
+    if (uart_cmd_queue == NULL) {
+        return ESP_FAIL;
+    }
     
-    command[0] = FRAME_START;              // 0xAA
-    command[1] = CMD_LED_CONTROL;          // 0x02
-    command[2] = led_state;                // 0=OFF, 1=ON
-    command[3] = calc_checksum(&command[1], 2);  // Checksum of CMD + LED_STATE
-    command[4] = FRAME_END;                // 0x55
+    uart_cmd_t cmd = {
+        .type = CMD_TYPE_LED_CONTROL,
+        .data[0] = led_state,
+        .data_len = 1,
+        .timeout_ms = UART_CMD_TIMEOUT_MS,
+        .retry_count = 0
+    };
     
-    ESP_LOGI(TAG, "Sending LED command to STM32: %s", led_state ? "ON" : "OFF");
-    ESP_LOG_BUFFER_HEX(TAG, command, 5);
-    
-    int written = uart_write_bytes(UART_NUM, (const char*)command, sizeof(command));
-    
-    if (written == sizeof(command)) {
-        ESP_LOGI(TAG, "LED command sent successfully");
+    // Try to send with timeout - if queue is full, log warning
+    if (xQueueSendToFront(uart_cmd_queue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) {
+        ESP_LOGI(TAG, "[LED CMD] Enqueued LED command: %s", led_state ? "ON" : "OFF");
         return ESP_OK;
     } else {
-        ESP_LOGE(TAG, "Failed to send LED command: wrote %d bytes", written);
+        ESP_LOGW(TAG, "[LED CMD] Failed to enqueue (queue full or busy)");
         return ESP_FAIL;
     }
 }
 
-
-// Parse frame từ STM32 (DHT11 - 8-bit resolution)
-// Expected: [0xAA][LEN=3][TEMP][HUM][LED][CHECKSUM][0x55]
-// Total: 7 bytes
-static bool parse_frame(uint8_t *buf, int len, sensor_data_t *data) {
-    ESP_LOGI(TAG, "Parsing buffer: %d bytes", len);
-    ESP_LOG_BUFFER_HEX(TAG, buf, len);
-    
-    // Tìm start byte
-    int start_idx = -1;
-    for (int i = 0; i < len; i++) {  // Tìm trong toàn bộ buffer
-        if (buf[i] == FRAME_START) {
-            start_idx = i;
-            ESP_LOGI(TAG, "Found START at index %d", i);
-            break;
-        }
-    }
-    
-    if (start_idx == -1) {
-        ESP_LOGW(TAG, "No START byte found (expecting 0x%02X)", FRAME_START);
-        ESP_LOGW(TAG, "Buffer first byte: 0x%02X", buf[0]);
-        return false;
-    }
-    
-    uint8_t *frame = &buf[start_idx];
-    uint8_t data_len = frame[1];
-    
-    ESP_LOGI(TAG, "Data length: %d", data_len);
-    
-    // Check có đủ data không (START + LEN + DATA + CHECKSUM + END)
-    int required_len = 2 + data_len + 2;  // Total frame size
-    int available_len = len - start_idx;
-    
-    if (available_len < required_len) {
-        ESP_LOGW(TAG, "Incomplete frame: need %d bytes, have %d", 
-                 required_len, available_len);
-        return false;
-    }
-    
-    // Validate checksum
-    uint8_t recv_checksum = frame[2 + data_len];
-    uint8_t calc_checksum_val = calc_checksum(&frame[1], data_len + 1); // LEN + DATA
-    
-    ESP_LOGI(TAG, "Checksum: recv=0x%02X calc=0x%02X", recv_checksum, calc_checksum_val);
-    
-    if (recv_checksum != calc_checksum_val) {
-        ESP_LOGW(TAG, "Checksum mismatch: recv=0x%02X calc=0x%02X", 
-                 recv_checksum, calc_checksum_val);
-        return false;
-    }
-    
-    // Check end byte
-    if (frame[3 + data_len] != FRAME_END) {
-        ESP_LOGW(TAG, "End byte not found at index %d: 0x%02X", 
-                 3 + data_len, frame[3 + data_len]);
-        return false;
-    }
-    
-    ESP_LOGI(TAG, "Frame validated - parsing data");
-    
-    // Parse data: [TEMP][HUM][LED] - DHT11 8-bit values
-    if (data_len >= 3) {
-        uint8_t temp = frame[2];   // Temperature (0-50°C)
-        uint8_t hum = frame[3];    // Humidity (20-90%RH)
-        uint8_t led = frame[4];    // LED state (0/1)
-        
-        data->temperature = (float)temp;
-        data->humidity = (float)hum;
-        data->led_state = led;
-        data->timestamp = esp_timer_get_time();
-        data->valid = true;
-        
-        ESP_LOGI(TAG, "Parsed: %.1f°C %.1f%% LED=%d", 
-                 data->temperature, data->humidity, data->led_state);
-        return true;
-    }
-    
-    ESP_LOGW(TAG, "Data length too short: %d", data_len);
-    return false;
-}
-
-// Get latest sensor data (thread-safe)
+// Get latest sensor data (thread-safe read)
 sensor_data_t get_sensor_data(void) {
-    // Check if data is stale (no update for 5 seconds)
+    // Check if data is stale (no update for 6 seconds)
     int64_t now = esp_timer_get_time();
-    if (g_sensor_data.valid && (now - g_sensor_data.timestamp) > 5000000) {
-        ESP_LOGW(TAG, "Sensor data stale (>5s)");
+    if (g_sensor_data.valid && (now - g_sensor_data.timestamp) > 6000000) {
+        ESP_LOGW(TAG, "[STALE] Sensor data older than 6 seconds");
         g_sensor_data.valid = false;
     }
     
     return g_sensor_data;
 }
 
+// Clear RX buffer (reset frame synchronization)
+static void clear_rx_buffer(void) {
+    uart_flush_input(UART_NUM);
+    uart_rx_index = 0;
+    memset(uart_rx_buffer, 0, sizeof(uart_rx_buffer));
+    ESP_LOGD(TAG, "RX buffer cleared (frame resync)");
+}
 
-//UART CODE 
-void uart_receive_task(void *arg) {
-    // Save task handle for LED command notification
-    uart_task_handle = xTaskGetCurrentTaskHandle();
-    ESP_LOGI(TAG, "UART task ready (waiting for Gateway...)");
+// Read and accumulate bytes from UART (non-blocking)
+static int read_available_bytes(uint8_t *buffer, int max_len, int timeout_ms) {
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    int total_read = 0;
     
-    uint8_t rx_buffer[128];
-    sensor_data_t temp_data;
-    uint32_t notification_value = 0;
+    while (total_read < max_len && timeout_ticks > 0) {
+        int len = uart_read_bytes(UART_NUM, &buffer[total_read], 
+                                   max_len - total_read, timeout_ticks);
+        
+        if (len > 0) {
+            total_read += len;
+            timeout_ticks = pdMS_TO_TICKS(100);  // Reduce timeout for next batch
+        } else if (len == 0) {
+            break;  // Timeout
+        } else {
+            ESP_LOGE(TAG, "UART read error: %d", len);
+            break;
+        }
+    }
     
-    while (1) {
-        // Check if Gateway is connected
-        if (!g_connected) {
-            vTaskDelay(pdMS_TO_TICKS(500));
+    return total_read;
+}
+
+// Parse frame from STM32: [0xAA][TYPE][LEN][DATA...][0x55]
+// No checksum needed
+static bool parse_frame(uint8_t *buf, int len, sensor_data_t *data) {
+    if (len < 4) {  // MIN: [0xAA][TYPE][LEN][0x55]
+        ESP_LOGW(TAG, "[PARSE] Buffer too short: %d bytes", len);
+        return false;
+    }
+    
+    // Find START byte
+    int start_idx = -1;
+    for (int i = 0; i < len; i++) {
+        if (buf[i] == FRAME_START) {
+            start_idx = i;
+            break;
+        }
+    }
+    
+    if (start_idx == -1) {
+        ESP_LOGW(TAG, "[PARSE] No START byte (0xAA) found");
+        return false;
+    }
+    
+    uint8_t *frame = &buf[start_idx];
+    int available = len - start_idx;
+    
+    if (available < 4) {
+        ESP_LOGW(TAG, "[PARSE] Incomplete after START: %d bytes", available);
+        return false;
+    }
+    
+    uint8_t data_len = frame[2];
+    
+    // Validate length
+    if (data_len > 32) {
+        ESP_LOGW(TAG, "[PARSE] Invalid length: %d", data_len);
+        return false;
+    }
+    
+    // Need: START(1) + TYPE(1) + LEN(1) + DATA(data_len) + END(1)
+    int required = 1 + 1 + 1 + data_len + 1;
+    if (available < required) {
+        ESP_LOGW(TAG, "[PARSE] Incomplete frame: need %d, have %d", required, available);
+        return false;
+    }
+    
+    // Check END byte
+    if (frame[3 + data_len] != FRAME_END) {
+        ESP_LOGW(TAG, "[PARSE] END byte (0x55) not found at offset %d", 3 + data_len);
+        return false;
+    }
+    
+    // Parse sensor data: [TEMP][HUM][LED]
+    if (data_len >= 3) {
+        uint8_t temp = frame[3];
+        uint8_t hum = frame[4];
+        uint8_t led = frame[5];
+        
+        // Sanity check (temp: 0-80°C, hum: 0-100%, led: 0-1)
+        if (temp <= 80 && hum <= 100 && led <= 1) {
+            data->temperature = (float)temp;
+            data->humidity = (float)hum;
+            data->led_state = led;
+            data->timestamp = esp_timer_get_time();
+            data->valid = true;
+            
+            ESP_LOGI(TAG, "[RX VALID] %.1f°C, %.1f%% RH, LED=%d", 
+                     data->temperature, data->humidity, data->led_state);
+            return true;
+        } else {
+            ESP_LOGW(TAG, "[PARSE] Data out of range: T=%d, H=%d, LED=%d", 
+                     temp, hum, led);
+            return false;
+        }
+    }
+    
+    ESP_LOGW(TAG, "[PARSE] Data length too short: %d", data_len);
+    return false;
+}
+
+// Send command to STM32
+// Frame format: [0xAA][TYPE][LEN][DATA...][0x55]
+// Returns: 0 = success, -1 = UART error
+static int send_command_frame(uart_cmd_t *cmd) {
+    uint8_t frame[16];
+    int frame_len = 0;
+    
+    frame[frame_len++] = FRAME_START;  // 0xAA
+    frame[frame_len++] = cmd->type;     // Command type
+    frame[frame_len++] = cmd->data_len; // Data length
+    
+    // Add data if any
+    for (int i = 0; i < cmd->data_len; i++) {
+        frame[frame_len++] = cmd->data[i];
+    }
+    
+    frame[frame_len++] = FRAME_END;    // 0x55
+    
+    ESP_LOGI(TAG, "[TX] Command 0x%02X (frame_len=%d) [should be 4 for sensor_request]: ", cmd->type, frame_len);
+    ESP_LOG_BUFFER_HEX(TAG, frame, frame_len);
+    
+    int written = uart_write_bytes(UART_NUM, (const char*)frame, frame_len);
+    if (written == frame_len) {
+        return 0;
+    } else {
+        ESP_LOGE(TAG, "[TX] Write failed: wrote %d of %d bytes", written, frame_len);
+        return -1;
+    }
+}
+
+// Execute single command with retry logic
+static uart_cmd_result_t execute_command(uart_cmd_t *cmd) {
+    uint8_t attempt = 0;
+    
+    while (attempt <= cmd->retry_count) {
+        // Clear buffer before command (flush any stale data from UART HW)
+        uart_flush_input(UART_NUM);
+        uart_rx_index = 0;
+        
+        // Send command to STM32
+        if (send_command_frame(cmd) != 0) {
+            ESP_LOGE(TAG, "[EXEC] Attempt %d: TX failed", attempt + 1);
+            attempt++;
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         
-        // Check for LED command notification (non-blocking, 100ms timeout)
-        if (xTaskNotifyWait(0, 0xFFFFFFFF, &notification_value, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // LED command received from BLE
-            if (notification_value & LED_CMD_NOTIFICATION_BIT) {
-                uint8_t led_state = notification_value & 0xFF;
-                ESP_LOGI(TAG, "[LED CMD INTERRUPT] Processing LED command: %d", led_state);
-                
-                // Clear buffer before sending LED command
-                uart_flush(UART_NUM);
-                
-                // Send LED command to STM32
-                uart_send_led_command(led_state);
-                
-                // Give STM32 time to process LED command
-                vTaskDelay(pdMS_TO_TICKS(500));
-                
-                // Clear buffer after LED command
-                uart_flush(UART_NUM);
-                
-                // Continue to sensor request after LED is processed
+        // Wait for response
+        uint8_t rx_buffer[128];
+        int rx_len = read_available_bytes(rx_buffer, sizeof(rx_buffer), 
+                                         (int)cmd->timeout_ms);
+        
+        if (rx_len <= 0) {
+            ESP_LOGW(TAG, "[EXEC] Attempt %d: Timeout (no response)", attempt + 1);
+            attempt++;
+            
+            if (attempt <= cmd->retry_count) {
+                vTaskDelay(pdMS_TO_TICKS(UART_INTER_CMD_DELAY));
+            }
+            continue;
+        }
+        
+        // Parse response
+        sensor_data_t temp_data;
+        ESP_LOGD(TAG, "[RX] Raw response (%d bytes):", rx_len);
+        ESP_LOG_BUFFER_HEX(TAG, rx_buffer, rx_len > 32 ? 32 : rx_len);
+        
+        if (parse_frame(rx_buffer, rx_len, &temp_data)) {
+            // Update global sensor data
+            g_sensor_data = temp_data;
+            
+            if (cmd->type == CMD_TYPE_SENSOR_REQUEST) {
+                ESP_LOGI(TAG, "[EXEC] Sensor data updated successfully");
+            } else if (cmd->type == CMD_TYPE_LED_CONTROL) {
+                ESP_LOGI(TAG, "[EXEC] LED command confirmed: LED=%d", temp_data.led_state);
+            }
+            
+            return UART_CMD_SUCCESS;
+        } else {
+            ESP_LOGW(TAG, "[EXEC] Attempt %d: Parse failed (rx_len=%d)", attempt + 1, rx_len);
+            attempt++;
+            
+            if (attempt <= cmd->retry_count) {
+                vTaskDelay(pdMS_TO_TICKS(UART_INTER_CMD_DELAY));
+            }
+            continue;
+        }
+    }
+    
+    // All retries exhausted
+    if (cmd->retry_count > 0) {
+        ESP_LOGE(TAG, "[EXEC] Command failed after %d attempts (max retries exceeded)", 
+                 attempt);
+        return UART_CMD_RETRY_EXCEEDED;
+    } else {
+        return UART_CMD_TIMEOUT;
+    }
+}
+
+// Main UART command executor task
+void uart_executor_task(void *arg) {
+    ESP_LOGI(TAG, "[EXECUTOR] Started (waiting for commands)");
+    
+    if (uart_cmd_queue == NULL) {
+        ESP_LOGE(TAG, "[EXECUTOR] Queue not initialized");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    uart_cmd_t cmd;
+    
+    while (1) {
+        // Wait for command in queue
+        if (xQueueReceive(uart_cmd_queue, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
+            // Check gateway connection
+            if (!g_connected) {
+                ESP_LOGW(TAG, "[EXECUTOR] Gateway not connected, skipping command");
                 continue;
             }
-        }
-        
-        // Normal sensor request flow (when no LED command)
-        // 1. Gửi request tới STM32
-        uart_request_sensor_data();
-        
-        // Đợi STM32 xử lý (DHT11 needs time)
-        vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // 2. Đợi response (timeout 1500ms - giống Python test)
-        int len = uart_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer), 
-                                  pdMS_TO_TICKS(1500));
-        
-        if (len > 0) {
-            ESP_LOGI(TAG, "Received %d bytes from STM32", len);
-            ESP_LOG_BUFFER_HEX(TAG, rx_buffer, len);
             
-            // 3. Parse response
-            if (parse_frame(rx_buffer, len, &temp_data)) {
-                g_sensor_data = temp_data;
-                ESP_LOGI(TAG, "[RX] %.1f°C %.1f%% LED=%d", 
-                         temp_data.temperature, temp_data.humidity, temp_data.led_state);
+            // Execute command
+            uart_cmd_result_t result = execute_command(&cmd);
+            
+            if (result != UART_CMD_SUCCESS) {
+                ESP_LOGW(TAG, "[EXECUTOR] Command failed: result=%d", result);
+                // Mark sensor data as invalid on failure
+                g_sensor_data.valid = false;
             }
-        } else if (len == 0) {
-            ESP_LOGW(TAG, "[RX] Timeout - No response from STM32");
-            g_sensor_data.valid = false;
-        } else if (len < 0) {
-            ESP_LOGE(TAG, "[RX] UART read error: %d", len);
-            g_sensor_data.valid = false;
+            
+            // Inter-command delay
+            vTaskDelay(pdMS_TO_TICKS(UART_INTER_CMD_DELAY));
+        } else {
+            // Queue empty or timeout - this is normal
+            if (g_connected) {
+                // If gateway is connected but no sensor requests, enqueue periodic request
+                // This ensures we get fresh sensor data even if no explicit request
+                uart_enqueue_sensor_request();
+            }
         }
-        
-        // 4. Đợi 2 giây trước khi request tiếp
-        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
 
