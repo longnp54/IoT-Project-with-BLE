@@ -155,21 +155,48 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 break;
             }
             
-            // Find params object
+            // Find params value
             const char *params_start = strstr(data_buffer, "\"params\":");
             char params[128] = {0};
             if (params_start != NULL) {
                 params_start += 9; // Skip "params":
                 while (*params_start == ' ' || *params_start == '\t') params_start++;
+                
+                const char *params_end = NULL;
+                size_t params_len = 0;
+                
+                // Handle different value types
                 if (*params_start == '{') {
-                    const char *params_end = strchr(params_start, '}');
+                    // Object: find closing }
+                    params_end = strchr(params_start, '}');
                     if (params_end != NULL) {
-                        size_t params_len = params_end - params_start + 1;
-                        if (params_len < sizeof(params)) {
-                            memcpy(params, params_start, params_len);
-                            params[params_len] = '\0';
-                        }
+                        params_len = params_end - params_start + 1;
                     }
+                } else if (*params_start == '[') {
+                    // Array: find closing ]
+                    params_end = strchr(params_start, ']');
+                    if (params_end != NULL) {
+                        params_len = params_end - params_start + 1;
+                    }
+                } else if (*params_start == '"') {
+                    // String: find closing quote
+                    params_end = strchr(params_start + 1, '"');
+                    if (params_end != NULL) {
+                        params_len = params_end - params_start + 1;
+                    }
+                } else {
+                    // Number, boolean, or null: find comma or closing brace
+                    params_end = params_start;
+                    while (*params_end != '\0' && *params_end != ',' && *params_end != '}') {
+                        params_end++;
+                    }
+                    params_len = params_end - params_start;
+                }
+                
+                if (params_len > 0 && params_len < sizeof(params)) {
+                    memcpy(params, params_start, params_len);
+                    params[params_len] = '\0';
+                    ESP_LOGI(TB_TAG, "Extracted params: '%s'", params);
                 }
             }
             

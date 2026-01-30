@@ -45,6 +45,10 @@ static esp_gattc_char_elem_t *char_elem_result   = NULL;
 static esp_gattc_descr_elem_t *descr_elem_result = NULL;
 static uint16_t write_char_handle = 0;
 
+// LED command caching
+static bool pending_led_cmd_valid = false;
+static uint8_t pending_led_cmd = 0;
+
 static void parse_sensor_data(uint8_t *data, uint16_t len, sensor_data_t *sensor_data);
 static void led_init(void);
 static bool rpc_callback_handler(const char *method, const char *params, int request_id);
@@ -118,22 +122,45 @@ static void led_init(void)
 // RPC callback handler
 static bool rpc_callback_handler(const char *method, const char *params, int request_id)
 {
-    ESP_LOGI(GATTC_TAG, "RPC Received - Method: %s, Params: %s, ID: %d", method, params, request_id);
+    ESP_LOGI(GATTC_TAG, "RPC Received - Method: %s, Params: '%s', ID: %d", method, params, request_id);
     
     if (strcmp(method, "setState") == 0) {
         // Check if BLE is connected and write characteristic is available
         if (!connect || write_char_handle == 0) {
-            ESP_LOGW(GATTC_TAG, "BLE not connected or WRITE characteristic not found");
-            return false;
+            ESP_LOGW(GATTC_TAG, "BLE not ready (connect=%d, write_char_handle=0x%04X), caching LED command", connect, write_char_handle);
+            // Cache the command for later
+            if (strstr(params, "true") != NULL || strstr(params, "1") != NULL) {
+                pending_led_cmd = 1;
+                pending_led_cmd_valid = true;
+                ESP_LOGI(GATTC_TAG, "Cached LED command: ON");
+            } else {
+                pending_led_cmd = 0;
+                pending_led_cmd_valid = true;
+                ESP_LOGI(GATTC_TAG, "Cached LED command: OFF");
+            }
+            return true;
         }
         
         // Parse params to determine LED state
-        // params could be: true, false, "true", "false", "1", "0"
+        // ThingsBoard can send params as: 1, 0, true, false, "1", "0", etc
         uint8_t led_command = 0;
         
-        if (strstr(params, "true") != NULL || strstr(params, "1") != NULL) {
+        ESP_LOGI(GATTC_TAG, "Parsing LED command from params: '%s'", params);
+        
+        // Check for true/1 values
+        if (strstr(params, "true") != NULL || 
+            strstr(params, "1") != NULL ||
+            strcmp(params, "1") == 0 ||
+            strcmp(params, "true") == 0) {
             led_command = 1;
+        } else if (strstr(params, "false") != NULL || 
+                   strstr(params, "0") != NULL ||
+                   strcmp(params, "0") == 0 ||
+                   strcmp(params, "false") == 0) {
+            led_command = 0;
         }
+        
+        ESP_LOGI(GATTC_TAG, "Final LED command: %d (ON if 1, OFF if 0)", led_command);
         
         // Send LED control command to ESP32 Device via BLE
         // ESP32 Device will forward this to STM32 via UART
